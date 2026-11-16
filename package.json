@@ -5,6 +5,7 @@
   "scripts": { "start": "node index.js" },
   "dependencies": {
     "@whiskeysockets/baileys": "latest",
+    "ffmpeg-static": "^5.2.0",
     "pino": "^9.0.0"
   },
   "engines": { "node": ">=20" }
