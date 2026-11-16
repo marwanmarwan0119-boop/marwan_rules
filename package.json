@@ -1,0 +1,11 @@
+{
+  "name": "emc-referee-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "@whiskeysockets/baileys": "latest",
+    "pino": "^9.0.0"
+  },
+  "engines": { "node": ">=20" }
+}
