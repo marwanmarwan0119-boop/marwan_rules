@@ -1,292 +1,156 @@
 import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  downloadMediaMessage
+  useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion,
+  downloadMediaMessage, normalizeMessageContent
 } from '@whiskeysockets/baileys'
 import pino from 'pino'
 import fs from 'fs'
+import os from 'os'
 import path from 'path'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
+import ffmpegPath from 'ffmpeg-static'
 
+const run = promisify(execFile)
+const logger = pino({ level: 'silent' })
 const rules = fs.readFileSync('./rules.txt', 'utf8')
 const SYSTEM = fs.readFileSync('./prompt.txt', 'utf8').replace('{rules}', rules)
 const AUTH_DIR = process.env.AUTH_DIR || './auth'
-const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').trim()
-const logger = pino({ level: 'silent' })
+const API_KEY = (process.env.GROQ_API_KEY || '').trim()
+const TEXT_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']
+const VISION_MODEL = (process.env.GROQ_VISION_MODEL || 'qwen/qwen3.8-27b').trim()
+const MAX_IMAGES = 3
+const MAX_VIDEO_MB = 60
+// اختياري: إلا بغيتي تحصر البوت فجروبات معينة. خليه فارغ باش يخدم فكل الجروبات.
+const ALLOWED = (process.env.ALLOWED_GROUPS || '')
+  .split(',').map(s => s.trim()).filter(Boolean)
 
-// Text models: first one is preferred, second one is the fallback.
-const GROQ_MODELS = [
-  'openai/gpt-oss-120b',
-  'openai/gpt-oss-20b'
-]
+const FAIL = 'السيرفر مشغول دابا، عاود المحاولة من بعد شوية.'
+const FAIL_IMG = 'ما قدرتش نقرا الصورة دابا، عاود صيفطها ولا كتب شنو فيها.'
+const sleep = ms => new Promise(r => setTimeout(r, ms))
 
-// Groq model for image understanding.
-const VISION_MODEL = 'qwen/qwen3.8-27b'
-const TRANSCRIPTION_MODEL = 'whisper-large-v3-turbo'
+// ---------- فلتر السب ----------
+function norm(s) {
+  return ' ' + s
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, '')
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ى/g, 'ي')
+    .replace(/ة/g, 'ه')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/(.)\1+/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim() + ' '
+}
+// زيد هنا أي كلمة بغيتي (كلمة وحدة ولا جوج كلمات)
+const BAD = [
+  'زب', 'زبي', 'قلوة', 'قود', 'تحوا',
+  'قحبة', 'ولد القحبة', 'ولاد القحبة'
+].map(w => norm(w))
+const isBad = text => {
+  const t = norm(text)
+  return BAD.some(w => t.includes(w))
+}
 
-// Number of previous text messages kept for each WhatsApp chat/group.
-const MEMORY_MESSAGES = Math.max(
-  2,
-  Number.parseInt(process.env.MEMORY_MESSAGES || '12', 10) || 12
-)
-const MEMORY_FILE = process.env.MEMORY_FILE || path.join(AUTH_DIR, 'memory.json')
-const memory = new Map()
+// ---------- ذاكرة صغيرة لكل جروب ----------
+const history = new Map()
+function remember(jid, name, text) {
+  const arr = history.get(jid) || []
+  arr.push(`${name}: ${text}`)
+  if (arr.length > 20) arr.shift()
+  history.set(jid, arr)
+}
 
-const FAIL = 'السيرفر ديال الذكاء الاصطناعي مشغول دابا، عاود المحاولة من بعد شوية.'
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-
-function loadMemory() {
+// ---------- استخراج صور من فيديو ----------
+async function videoFrames(buf) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v-'))
+  const file = path.join(dir, 'in.mp4')
+  fs.writeFileSync(file, buf)
   try {
-    if (!fs.existsSync(MEMORY_FILE)) return
-
-    const saved = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'))
-    for (const [chatId, messages] of Object.entries(saved)) {
-      if (Array.isArray(messages)) {
-        memory.set(chatId, messages.slice(-MEMORY_MESSAGES))
+    let dur = 0
+    try {
+      await run(ffmpegPath, ['-i', file])
+    } catch (e) {
+      const mt = /Duration: (\d+):(\d+):(\d+\.?\d*)/.exec(e.stderr || '')
+      if (mt) dur = +mt[1] * 3600 + +mt[2] * 60 + +mt[3]
+    }
+    const points = dur > 0 ? [0.1, 0.5, 0.9] : [0]
+    const frames = []
+    for (const [i, p] of points.entries()) {
+      const out = path.join(dir, `f${i}.jpg`)
+      try {
+        await run(ffmpegPath, [
+          '-y', '-ss', String(Math.max(0, dur * p)), '-i', file,
+          '-frames:v', '1', '-vf', 'scale=1280:-2', '-q:v', '4', out
+        ])
+        if (fs.existsSync(out)) frames.push(fs.readFileSync(out))
+      } catch (e) {
+        console.log('frame failed:', e.message)
       }
     }
-
-    console.log('Memory loaded for chats:', memory.size)
-  } catch (e) {
-    console.log('MEMORY LOAD ERROR:', e.message)
+    return frames
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
   }
 }
 
-async function saveMemory() {
-  try {
-    await fs.promises.mkdir(path.dirname(MEMORY_FILE), { recursive: true })
-    await fs.promises.writeFile(
-      MEMORY_FILE,
-      JSON.stringify(Object.fromEntries(memory)),
-      'utf8'
-    )
-  } catch (e) {
-    console.log('MEMORY SAVE ERROR:', e.message)
+// ---------- Groq ----------
+async function callGroq(model, content) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${API_KEY}`
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.2,
+          messages: [
+            { role: 'system', content: SYSTEM },
+            { role: 'user', content }
+          ]
+        })
+      })
+      const data = await res.json()
+      if (res.ok) {
+        const out = data?.choices?.[0]?.message?.content?.trim()
+        if (out) return out
+      }
+      console.log('GROQ ERROR', model, res.status, JSON.stringify(data).slice(0, 300))
+      if (![429, 500, 502, 503].includes(res.status)) break
+    } catch (e) {
+      console.log('GROQ FETCH ERROR', model, e.message)
+    }
+    await sleep(2000 * attempt)
   }
+  return null
 }
 
-function getChatHistory(chatId) {
-  return memory.get(chatId)?.slice(-MEMORY_MESSAGES) || []
-}
-
-async function remember(chatId, userText, assistantText) {
-  const history = getChatHistory(chatId)
-  history.push(
-    { role: 'user', content: userText },
-    { role: 'assistant', content: assistantText }
-  )
-  memory.set(chatId, history.slice(-MEMORY_MESSAGES))
-  await saveMemory()
-}
-
-function isTemporaryError(status) {
-  return [429, 500, 502, 503, 504].includes(status)
-}
-
-function retryWaitMs(res, attempt) {
-  const retryAfter = Number(res.headers.get('retry-after'))
-  return Number.isFinite(retryAfter) && retryAfter > 0
-    ? retryAfter * 1000
-    : 2000 * attempt
-}
-
-async function askGroqText(text, history = []) {
-  if (!GROQ_API_KEY) {
+async function askGroq(text, images = []) {
+  if (!API_KEY) {
     console.log('GROQ ERROR: GROQ_API_KEY is missing')
     return FAIL
   }
-
-  for (const model of GROQ_MODELS) {
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${GROQ_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            model,
-            messages: [
-              { role: 'system', content: SYSTEM },
-              ...history,
-              { role: 'user', content: text }
-            ],
-            temperature: 0.7,
-            max_completion_tokens: 1024
-          })
-        })
-
-        const data = await res.json()
-
-        if (res.ok) {
-          const reply = data?.choices?.[0]?.message?.content?.trim()
-          if (reply) return reply
-          console.log('GROQ EMPTY', model, JSON.stringify(data).slice(0, 300))
-          break
-        }
-
-        console.log(
-          'GROQ ERROR',
-          model,
-          'try',
-          attempt,
-          res.status,
-          JSON.stringify(data).slice(0, 300)
-        )
-
-        if (isTemporaryError(res.status) && attempt < 3) {
-          await sleep(retryWaitMs(res, attempt))
-          continue
-        }
-
-        // Try the fallback text model.
-        break
-      } catch (e) {
-        console.log('GROQ FETCH ERROR', model, 'try', attempt, e.message)
-        if (attempt < 3) await sleep(2000 * attempt)
-      }
-    }
+  if (images.length) {
+    const content = [
+      { type: 'text', text },
+      ...images.slice(0, MAX_IMAGES).map(b => ({
+        type: 'image_url',
+        image_url: { url: `data:image/jpeg;base64,${b.toString('base64')}` }
+      }))
+    ]
+    return (await callGroq(VISION_MODEL, content)) || FAIL_IMG
   }
-
+  for (const model of TEXT_MODELS) {
+    const out = await callGroq(model, text)
+    if (out) return out
+  }
   return FAIL
 }
 
-async function askGroqVision(question, imageBuffer, mimetype, history = []) {
-  if (!GROQ_API_KEY) {
-    console.log('GROQ ERROR: GROQ_API_KEY is missing')
-    return FAIL
-  }
-
-  if (!imageBuffer || imageBuffer.length > 20 * 1024 * 1024) {
-    return 'الصورة كبيرة بزاف. صيفط صورة أقل من 20MB من فضلك.'
-  }
-
-  const safeMime = (mimetype || 'image/jpeg').split(';')[0]
-  const base64Image = imageBuffer.toString('base64')
-  const imageDataUrl = `data:${safeMime};base64,${base64Image}`
-
-  try {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: VISION_MODEL,
-        messages: [
-          { role: 'system', content: SYSTEM },
-          ...history,
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: question || 'شرح ليا شنو كاين فهاد الصورة.' },
-              { type: 'image_url', image_url: { url: imageDataUrl } }
-            ]
-          }
-        ],
-        temperature: 0.7,
-        max_completion_tokens: 1024
-      })
-    })
-
-    const data = await res.json()
-    if (res.ok) {
-      const reply = data?.choices?.[0]?.message?.content?.trim()
-      if (reply) return reply
-    }
-
-    console.log('GROQ VISION ERROR', res.status, JSON.stringify(data).slice(0, 500))
-    return FAIL
-  } catch (e) {
-    console.log('GROQ VISION FETCH ERROR:', e.message)
-    return FAIL
-  }
-}
-
-async function transcribeAudio(audioBuffer, mimetype) {
-  if (!GROQ_API_KEY) {
-    console.log('GROQ ERROR: GROQ_API_KEY is missing')
-    return null
-  }
-
-  if (!audioBuffer || audioBuffer.length > 25 * 1024 * 1024) {
-    console.log('AUDIO ERROR: file is larger than 25MB')
-    return null
-  }
-
-  try {
-    const safeMime = (mimetype || 'audio/ogg').split(';')[0]
-    const extension = safeMime.includes('mpeg') || safeMime.includes('mp3')
-      ? 'mp3'
-      : safeMime.includes('wav')
-        ? 'wav'
-        : safeMime.includes('webm')
-          ? 'webm'
-          : 'ogg'
-
-    const form = new FormData()
-    form.append(
-      'file',
-      new Blob([audioBuffer], { type: safeMime }),
-      `whatsapp-audio.${extension}`
-    )
-    form.append('model', TRANSCRIPTION_MODEL)
-    form.append('response_format', 'json')
-    form.append('prompt', 'الرسالة قد تكون بالدارجة المغربية أو العربية.')
-
-    const res = await fetch(
-      'https://api.groq.com/openai/v1/audio/transcriptions',
-      {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
-        body: form
-      }
-    )
-
-    const data = await res.json()
-    if (res.ok && data?.text?.trim()) return data.text.trim()
-
-    console.log('GROQ TRANSCRIPTION ERROR', res.status, JSON.stringify(data).slice(0, 500))
-    return null
-  } catch (e) {
-    console.log('GROQ TRANSCRIPTION FETCH ERROR:', e.message)
-    return null
-  }
-}
-
-function getContextInfo(message) {
-  return message?.extendedTextMessage?.contextInfo
-    || message?.imageMessage?.contextInfo
-    || message?.audioMessage?.contextInfo
-    || message?.videoMessage?.contextInfo
-    || message?.documentMessage?.contextInfo
-}
-
-function getMessageText(message) {
-  return message?.conversation
-    || message?.extendedTextMessage?.text
-    || message?.imageMessage?.caption
-    || message?.videoMessage?.caption
-    || message?.documentMessage?.caption
-    || ''
-}
-
-function getQuotedText(contextInfo) {
-  const quoted = contextInfo?.quotedMessage
-  return quoted?.conversation
-    || quoted?.extendedTextMessage?.text
-    || quoted?.imageMessage?.caption
-    || quoted?.videoMessage?.caption
-    || quoted?.documentMessage?.caption
-    || ''
-}
-
+// ---------- البوت ----------
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
-  loadMemory()
-
   const { version } = await fetchLatestBaileysVersion()
   const sock = makeWASocket({ version, auth: state, logger })
   let asked = false
@@ -304,98 +168,123 @@ async function start() {
         asked = false
       }
     }
-
     if (connection === 'open') console.log('Bot connected')
-
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode
       console.log('connection closed, code:', code)
-      if (code !== DisconnectReason.loggedOut) {
-        setTimeout(start, 3000)
-      } else {
-        console.log('logged out, change AUTH_DIR and relink')
-      }
+      if (code !== DisconnectReason.loggedOut) setTimeout(start, 3000)
+      else console.log('logged out, change AUTH_DIR and relink')
     }
   })
+
+  async function punish(m, jid, sender) {
+    try {
+      const meta = await sock.groupMetadata(jid)
+      const p = meta.participants.find(
+        x => x.id === sender || x.lid === sender || x.phoneNumber === sender
+      )
+      if (p?.admin) return console.log('insult from admin, skipped')
+      try { await sock.sendMessage(jid, { delete: m.key }) } catch (e) { console.log('delete failed:', e.message) }
+      await sock.groupParticipantsUpdate(jid, [sender], 'remove')
+      await sock.sendMessage(jid, {
+        text: `🚫 تم طرد @${sender.split('@')[0]} بسبب السب والشتم (المادة 11).`,
+        mentions: [sender]
+      })
+    } catch (e) {
+      console.log('kick failed (is the bot admin?):', e.message)
+    }
+  }
+
+  const getMedia = (msgObj, key) =>
+    downloadMediaMessage(
+      { key, message: msgObj }, 'buffer', {},
+      { logger, reuploadRequest: sock.updateMediaMessage }
+    )
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const m of messages) {
       try {
         if (!m.message || m.key.fromMe) continue
+        const jid = m.key.remoteJid
+        if (!jid || !jid.endsWith('@g.us')) continue // ما كيجاوبش فالخاص
+        if (ALLOWED.length && !ALLOWED.includes(jid)) continue
 
-        const chatId = m.key.remoteJid
-        const message = m.message
-        const image = message.imageMessage
-        const audio = message.audioMessage
-        const contextInfo = getContextInfo(message)
-        const text = getMessageText(message).trim()
+        const msg = normalizeMessageContent(m.message)
+        if (!msg) continue
+        const ext = msg.extendedTextMessage
+        const img = msg.imageMessage
+        const vid = msg.videoMessage
+        const text = msg.conversation || ext?.text || img?.caption || vid?.caption || ''
+        const ctx = ext?.contextInfo || img?.contextInfo || vid?.contextInfo
+        const sender = m.key.participant
+        const name = m.pushName || sender?.split('@')[0] || 'لاعب'
+
+        // طرد اللي كيسب
+        if (text && sender && isBad(text)) {
+          await punish(m, jid, sender)
+          continue
+        }
+
+        if (text) remember(jid, name, text.slice(0, 300))
 
         const myIds = [sock.user?.id, sock.user?.lid]
-          .filter(Boolean)
-          .map(x => x.split(':')[0].split('@')[0])
-
-        const mentioned = (contextInfo?.mentionedJid || [])
+          .filter(Boolean).map(x => x.split(':')[0].split('@')[0])
+        const mentioned = (ctx?.mentionedJid || [])
           .some(j => myIds.includes(j.split('@')[0]))
+        if (!mentioned) continue
 
-        const isPrivateChat = !chatId.endsWith('@g.us')
-        const quotedParticipant = contextInfo?.participant || ''
-        const isReplyToBot = myIds.includes(quotedParticipant.split(':')[0].split('@')[0])
+        // الصور والفيديوات (من الرسالة نفسها أو من الرسالة المقتبسة)
+        const q = ctx?.quotedMessage
+        const qKey = ctx?.stanzaId
+          ? { remoteJid: jid, id: ctx.stanzaId, participant: ctx.participant }
+          : null
 
-        // In groups, process only mentions/replies. In private chats, process every text/media message.
-        if (!mentioned && !isPrivateChat && !isReplyToBot) continue
+        const images = []
+        let fromVideo = false
+        try {
+          if (img) images.push(await getMedia(msg, m.key))
+          if (q?.imageMessage && qKey) images.push(await getMedia(q, qKey))
 
-        const quotedText = getQuotedText(contextInfo)
-        const clean = text.replace(/@\d+/g, '').trim()
-        const question = quotedText
-          ? `الرسالة المقتبسة: ${quotedText}\n\nالطلب: ${clean}`
-          : clean
-        const history = getChatHistory(chatId)
-
-        let reply
-        let memoryInput
-
-        if (image) {
-          const imageBuffer = await downloadMediaMessage(
-            m,
-            'buffer',
-            {},
-            { logger }
-          )
-          const imageQuestion = question || 'شرح ليا شنو كاين فهاد الصورة.'
-          reply = await askGroqVision(
-            imageQuestion,
-            imageBuffer,
-            image.mimetype,
-            history
-          )
-          memoryInput = `[صورة] ${imageQuestion}`
-        } else if (audio) {
-          const audioBuffer = await downloadMediaMessage(
-            m,
-            'buffer',
-            {},
-            { logger }
-          )
-          const transcript = await transcribeAudio(audioBuffer, audio.mimetype)
-
-          if (!transcript) {
-            reply = 'ماقدرتش نقرا الرسالة الصوتية. عاود صيفطها أو جرب تسجيل آخر.'
-            memoryInput = '[رسالة صوتية غير مقروءة]'
-          } else {
-            memoryInput = `[رسالة صوتية محولة إلى نص]: ${transcript}`
-            reply = await askGroqText(memoryInput, history)
+          const videoSrc = vid ? { obj: msg, key: m.key, size: vid.fileLength }
+            : q?.videoMessage && qKey ? { obj: q, key: qKey, size: q.videoMessage.fileLength }
+            : null
+          if (videoSrc && !images.length) {
+            if (Number(videoSrc.size || 0) > MAX_VIDEO_MB * 1024 * 1024) {
+              await sock.sendMessage(jid, {
+                text: 'الفيديو كبير بزاف. صيفط سكرين من الريكورد ولا فيديو أقصر.'
+              }, { quoted: m })
+              continue
+            }
+            const buf = await getMedia(videoSrc.obj, videoSrc.key)
+            images.push(...(await videoFrames(buf)))
+            fromVideo = true
           }
-        } else {
-          if (!question) continue
-          memoryInput = question
-          reply = await askGroqText(question, history)
+        } catch (e) {
+          console.log('media failed:', e.message)
         }
 
-        await sock.sendMessage(chatId, { text: reply }, { quoted: m })
-
-        if (reply !== FAIL && !reply.startsWith('ماقدرتش نقرا')) {
-          await remember(chatId, memoryInput, reply)
+        if (fromVideo && !images.length) {
+          await sock.sendMessage(jid, {
+            text: 'ما قدرتش نقرا الفيديو. صيفط سكرين من الريكورد.'
+          }, { quoted: m })
+          continue
         }
+
+        const clean = text.replace(/@\d+/g, '').trim()
+        const quotedText = q?.conversation || q?.extendedTextMessage?.text
+        const recent = (history.get(jid) || []).join('\n')
+        const mediaNote = images.length
+          ? fromVideo
+            ? `\n(مرفقة ${images.length} صور مأخوذة من فيديو ريكورد: بداية، وسط، نهاية. ما شفتيش باقي الفيديو.)`
+            : `\n(مرفقة ${images.length} صورة)`
+          : ''
+        const input =
+          `آخر الرسائل فالجروب:\n${recent}\n\n` +
+          (quotedText ? `الرسالة المقتبسة: ${quotedText}\n\n` : '') +
+          `الطلب من ${name}: ${clean || '(بلا نص)'}` + mediaNote
+
+        const reply = await askGroq(input, images)
+        await sock.sendMessage(jid, { text: reply }, { quoted: m })
       } catch (e) {
         console.log('message error:', e.message)
       }
