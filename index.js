@@ -7,25 +7,45 @@ import fs from 'fs'
 const rules = fs.readFileSync('./rules.txt', 'utf8')
 const SYSTEM = fs.readFileSync('./prompt.txt', 'utf8').replace('{rules}', rules)
 const AUTH_DIR = process.env.AUTH_DIR || './auth'
-const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash'
+const API_KEY = (process.env.GEMINI_API_KEY || '').trim()
+const MODELS = [
+  process.env.GEMINI_MODEL,
+  'gemini-2.5-flash',
+  'gemini-flash-latest',
+  'gemini-2.0-flash'
+].filter(Boolean)
+
+const FAIL = 'وقع مشكل تقني، عاود المحاولة.'
 
 async function askGemini(text) {
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM }] },
-        contents: [{ role: 'user', parts: [{ text }] }]
-      })
-    })
-    const data = await res.json()
-    return data?.candidates?.[0]?.content?.parts?.[0]?.text || 'وقع مشكل تقني، عاود المحاولة.'
-  } catch (e) {
-    console.log('gemini error:', e.message)
-    return 'وقع مشكل تقني، عاود المحاولة.'
+  if (!API_KEY) {
+    console.log('GEMINI ERROR: GEMINI_API_KEY is missing')
+    return FAIL
   }
+  for (const model of MODELS) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: SYSTEM }] },
+          contents: [{ role: 'user', parts: [{ text }] }]
+        })
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        console.log('GEMINI ERROR', model, res.status, JSON.stringify(data).slice(0, 400))
+        continue
+      }
+      const out = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim()
+      if (out) return out
+      console.log('GEMINI EMPTY', model, JSON.stringify(data).slice(0, 400))
+    } catch (e) {
+      console.log('GEMINI FETCH ERROR', model, e.message)
+    }
+  }
+  return FAIL
 }
 
 async function start() {
@@ -57,7 +77,7 @@ async function start() {
       if (code !== DisconnectReason.loggedOut) {
         setTimeout(start, 3000)
       } else {
-        console.log('logged out, delete the auth folder and relink')
+        console.log('logged out, change AUTH_DIR and relink')
       }
     }
   })
