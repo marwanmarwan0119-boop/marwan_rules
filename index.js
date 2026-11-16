@@ -10,12 +10,12 @@ const AUTH_DIR = process.env.AUTH_DIR || './auth'
 const API_KEY = (process.env.GEMINI_API_KEY || '').trim()
 const MODELS = [
   process.env.GEMINI_MODEL,
-  'gemini-2.5-flash',
-  'gemini-flash-latest',
-  'gemini-2.0-flash'
-].filter(Boolean)
+  'gemini-3.8-flash',
+  'gemini-flash-latest'
+].filter((m, i, a) => m && a.indexOf(m) === i)
 
-const FAIL = 'وقع مشكل تقني، عاود المحاولة.'
+const FAIL = 'السيرفر ديال الذكاء الاصطناعي مشغول دابا، عاود المحاولة من بعد شوية.'
+const sleep = ms => new Promise(r => setTimeout(r, ms))
 
 async function askGemini(text) {
   if (!API_KEY) {
@@ -23,26 +23,34 @@ async function askGemini(text) {
     return FAIL
   }
   for (const model of MODELS) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM }] },
-          contents: [{ role: 'user', parts: [{ text }] }]
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: SYSTEM }] },
+            contents: [{ role: 'user', parts: [{ text }] }]
+          })
         })
-      })
-      const data = await res.json()
-      if (!res.ok) {
-        console.log('GEMINI ERROR', model, res.status, JSON.stringify(data).slice(0, 400))
-        continue
+        const data = await res.json()
+        if (res.ok) {
+          const out = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim()
+          if (out) return out
+          console.log('GEMINI EMPTY', model, JSON.stringify(data).slice(0, 300))
+          break
+        }
+        console.log('GEMINI ERROR', model, 'try', attempt, res.status, JSON.stringify(data).slice(0, 300))
+        if (res.status === 503 || res.status === 429) {
+          await sleep(2000 * attempt)
+          continue
+        }
+        break
+      } catch (e) {
+        console.log('GEMINI FETCH ERROR', model, e.message)
+        await sleep(2000 * attempt)
       }
-      const out = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim()
-      if (out) return out
-      console.log('GEMINI EMPTY', model, JSON.stringify(data).slice(0, 400))
-    } catch (e) {
-      console.log('GEMINI FETCH ERROR', model, e.message)
     }
   }
   return FAIL
