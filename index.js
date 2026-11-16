@@ -20,6 +20,7 @@ const TEXT_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']
 const VISION_MODEL = (process.env.GROQ_VISION_MODEL || 'qwen/qwen3.8-27b').trim()
 const MAX_IMAGES = 3
 const MAX_VIDEO_MB = 60
+const ADMIN_GROUP = (process.env.ADMIN_GROUP || '').trim() // جروب الإدارة (للاستئناف)
 // اختياري: إلا بغيتي تحصر البوت فجروبات معينة. خليه فارغ باش يخدم فكل الجروبات.
 const ALLOWED = (process.env.ALLOWED_GROUPS || '')
   .split(',').map(s => s.trim()).filter(Boolean)
@@ -27,6 +28,17 @@ const ALLOWED = (process.env.ALLOWED_GROUPS || '')
 const FAIL = 'السيرفر مشغول دابا، عاود المحاولة من بعد شوية.'
 const FAIL_IMG = 'ما قدرتش نقرا الصورة دابا، عاود صيفطها ولا كتب شنو فيها.'
 const sleep = ms => new Promise(r => setTimeout(r, ms))
+
+// ---------- رسالة الترحيب (بدلها كيف بغيتي) ----------
+const WELCOME = tags =>
+  `👋 مرحبا ${tags} فـ EMC LIGA V6!\n\n` +
+  `أهم القوانين:\n` +
+  `⏱️ الجولة 48 ساعة، وإدخال اللائحة وتحديد الموعد داخل 12 ساعة\n` +
+  `🎥 الريكورد خاصو يبان فيه: ID Room، Chat، ID Compte، اسم الهاتف\n` +
+  `🚫 السب والاستفزاز ممنوعين\n` +
+  `⚖️ عندك مشكل فالماتش؟ تاغ البوت وكتب المشكل\n` +
+  `📣 ما عجبكش القرار؟ تاغ البوت وكتب: استئناف\n\n` +
+  `الانضباط • الاحترام • المنافسة الشريفة`
 
 // ---------- فلتر السب ----------
 function norm(s) {
@@ -52,6 +64,7 @@ const isBad = text => {
 
 // ---------- ذاكرة صغيرة لكل جروب ----------
 const history = new Map()
+const lastRuling = new Map()
 function remember(jid, name, text) {
   const arr = history.get(jid) || []
   arr.push(`${name}: ${text}`)
@@ -155,6 +168,9 @@ async function start() {
   const sock = makeWASocket({ version, auth: state, logger })
   let asked = false
 
+  const myIds = () => [sock.user?.id, sock.user?.lid]
+    .filter(Boolean).map(x => x.split(':')[0].split('@')[0])
+
   sock.ev.on('creds.update', saveCreds)
 
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
@@ -177,6 +193,26 @@ async function start() {
     }
   })
 
+  // ---------- ترحيب باللاعبين الجداد ----------
+  sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
+    try {
+      if (action !== 'add') return
+      if (id === ADMIN_GROUP) return
+      if (ALLOWED.length && !ALLOWED.includes(id)) return
+      const me = myIds()
+      const jids = (participants || [])
+        .map(p => (typeof p === 'string' ? p : p?.id))
+        .filter(Boolean)
+        .filter(j => !me.includes(j.split(':')[0].split('@')[0]))
+      if (!jids.length) return
+      const tags = jids.map(j => '@' + j.split('@')[0]).join(' ')
+      await sock.sendMessage(id, { text: WELCOME(tags), mentions: jids })
+    } catch (e) {
+      console.log('welcome error:', e.message)
+    }
+  })
+
+  // ---------- طرد اللي كيسب ----------
   async function punish(m, jid, sender) {
     try {
       const meta = await sock.groupMetadata(jid)
@@ -192,6 +228,37 @@ async function start() {
       })
     } catch (e) {
       console.log('kick failed (is the bot admin?):', e.message)
+    }
+  }
+
+  // ---------- الاستئناف ----------
+  async function handleAppeal(m, jid, name) {
+    if (!ADMIN_GROUP) {
+      await sock.sendMessage(jid, {
+        text: 'جروب الإدارة ما تربطش بعد. عاود من بعد.'
+      }, { quoted: m })
+      return
+    }
+    let subject = jid
+    try { subject = (await sock.groupMetadata(jid)).subject } catch (e) { /* ignore */ }
+    const rec = lastRuling.get(jid)
+    const recent = (history.get(jid) || []).slice(-10).join('\n')
+    const body =
+      `📣 استئناف جديد\n\n` +
+      `👥 الجروب: ${subject}\n` +
+      `🙋 المستأنف: ${name}\n\n` +
+      `⚖️ آخر قرار ديال البوت:\n${rec?.text || '(ما كاينش)'}\n\n` +
+      `💬 آخر الرسائل:\n${recent || '(ما كاينش)'}`
+    try {
+      await sock.sendMessage(ADMIN_GROUP, { text: body.slice(0, 3500) })
+      await sock.sendMessage(jid, {
+        text: '✅ تم تحويل استئنافك للإدارة، غادي يراجعو القرار.'
+      }, { quoted: m })
+    } catch (e) {
+      console.log('appeal failed:', e.message)
+      await sock.sendMessage(jid, {
+        text: 'ما قدرتش نصيفط الاستئناف دابا. عاود المحاولة.'
+      }, { quoted: m })
     }
   }
 
@@ -227,11 +294,22 @@ async function start() {
 
         if (text) remember(jid, name, text.slice(0, 300))
 
-        const myIds = [sock.user?.id, sock.user?.lid]
-          .filter(Boolean).map(x => x.split(':')[0].split('@')[0])
+        const me = myIds()
         const mentioned = (ctx?.mentionedJid || [])
-          .some(j => myIds.includes(j.split('@')[0]))
+          .some(j => me.includes(j.split('@')[0]))
         if (!mentioned) continue
+
+        const clean = text.replace(/@\d+/g, '').trim()
+
+        // أوامر خاصة
+        if (clean.includes('/id')) {
+          await sock.sendMessage(jid, { text: `ID ديال هاد الجروب:\n${jid}` }, { quoted: m })
+          continue
+        }
+        if (/استئناف|استيناف|استانف|استأنف|استئنف/.test(clean)) {
+          await handleAppeal(m, jid, name)
+          continue
+        }
 
         // الصور والفيديوات (من الرسالة نفسها أو من الرسالة المقتبسة)
         const q = ctx?.quotedMessage
@@ -270,7 +348,6 @@ async function start() {
           continue
         }
 
-        const clean = text.replace(/@\d+/g, '').trim()
         const quotedText = q?.conversation || q?.extendedTextMessage?.text
         const recent = (history.get(jid) || []).join('\n')
         const mediaNote = images.length
@@ -284,6 +361,9 @@ async function start() {
           `الطلب من ${name}: ${clean || '(بلا نص)'}` + mediaNote
 
         const reply = await askGroq(input, images)
+        if (reply !== FAIL && reply !== FAIL_IMG) {
+          lastRuling.set(jid, { text: reply, time: Date.now() })
+        }
         await sock.sendMessage(jid, { text: reply }, { quoted: m })
       } catch (e) {
         console.log('message error:', e.message)
