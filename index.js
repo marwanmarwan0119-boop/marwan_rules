@@ -9,8 +9,11 @@ const SYSTEM = fs.readFileSync('./prompt.txt', 'utf8').replace('{rules}', rules)
 const AUTH_DIR = process.env.AUTH_DIR || './auth'
 const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').trim()
 
-// Production Groq model suitable for a multilingual WhatsApp bot.
-const MODEL = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').trim()
+// The first model is preferred. The second one is used as a fallback.
+const GROQ_MODELS = [
+  'openai/gpt-oss-120b',
+  'openai/gpt-oss-20b'
+]
 
 const FAIL = 'السيرفر ديال الذكاء الاصطناعي مشغول دابا، عاود المحاولة من بعد شوية.'
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -21,61 +24,64 @@ async function askGroq(text) {
     return FAIL
   }
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          model: MODEL,
-          messages: [
-            { role: 'system', content: SYSTEM },
-            { role: 'user', content: text }
-          ],
-          temperature: 0.7,
-          max_tokens: 1024
+  for (const model of GROQ_MODELS) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${GROQ_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: 'system', content: SYSTEM },
+              { role: 'user', content: text }
+            ],
+            temperature: 0.7,
+            max_completion_tokens: 1024
+          })
         })
-      })
 
-      const data = await res.json()
+        const data = await res.json()
 
-      if (res.ok) {
-        const out = data?.choices?.[0]?.message?.content?.trim()
-        if (out) return out
+        if (res.ok) {
+          const reply = data?.choices?.[0]?.message?.content?.trim()
+          if (reply) return reply
 
-        console.log('GROQ EMPTY', MODEL, JSON.stringify(data).slice(0, 300))
+          console.log('GROQ EMPTY', model, JSON.stringify(data).slice(0, 300))
+          break
+        }
+
+        console.log(
+          'GROQ ERROR',
+          model,
+          'try',
+          attempt,
+          res.status,
+          JSON.stringify(data).slice(0, 300)
+        )
+
+        // Try the same model again for temporary errors and rate limits.
+        const temporaryError = [429, 500, 502, 503, 504].includes(res.status)
+        if (temporaryError && attempt < 3) {
+          const retryAfter = Number(res.headers.get('retry-after'))
+          const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+            ? retryAfter * 1000
+            : 2000 * attempt
+          await sleep(waitMs)
+          continue
+        }
+
+        // Move to the fallback model for model/service availability errors.
         break
-      }
+      } catch (e) {
+        console.log('GROQ FETCH ERROR', model, 'try', attempt, e.message)
 
-      console.log(
-        'GROQ ERROR',
-        MODEL,
-        'try',
-        attempt,
-        res.status,
-        JSON.stringify(data).slice(0, 300)
-      )
-
-      // Retry temporary rate-limit or server errors only.
-      if ([429, 500, 502, 503, 504].includes(res.status) && attempt < 3) {
-        const retryAfter = Number(res.headers.get('retry-after'))
-        const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
-          ? retryAfter * 1000
-          : 2000 * attempt
-        await sleep(waitMs)
-        continue
-      }
-
-      // 400, 401, 403, 404, etc. are configuration errors; retrying will not help.
-      break
-    } catch (e) {
-      console.log('GROQ FETCH ERROR', MODEL, e.message)
-
-      if (attempt < 3) {
-        await sleep(2000 * attempt)
+        if (attempt < 3) {
+          await sleep(2000 * attempt)
+        }
       }
     }
   }
@@ -86,7 +92,11 @@ async function askGroq(text) {
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
   const { version } = await fetchLatestBaileysVersion()
-  const sock = makeWASocket({ version, auth: state, logger: pino({ level: 'silent' }) })
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger: pino({ level: 'silent' })
+  })
 
   let asked = false
 
