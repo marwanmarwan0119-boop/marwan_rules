@@ -3,6 +3,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys'
 import pino from 'pino'
 import fs from 'fs'
+import path from 'path'
 
 const rules = fs.readFileSync('./rules.txt', 'utf8')
 const SYSTEM = fs.readFileSync('./prompt.txt', 'utf8').replace('{rules}', rules)
@@ -15,10 +16,59 @@ const GROQ_MODELS = [
   'openai/gpt-oss-20b'
 ]
 
+// Number of previous chat messages kept per WhatsApp chat/group.
+const MEMORY_MESSAGES = Math.max(
+  2,
+  Number.parseInt(process.env.MEMORY_MESSAGES || '12', 10) || 12
+)
+const MEMORY_FILE = process.env.MEMORY_FILE || path.join(AUTH_DIR, 'memory.json')
+const memory = new Map()
+
 const FAIL = 'السيرفر ديال الذكاء الاصطناعي مشغول دابا، عاود المحاولة من بعد شوية.'
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-async function askGroq(text) {
+function loadMemory() {
+  try {
+    if (!fs.existsSync(MEMORY_FILE)) return
+
+    const saved = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'))
+    for (const [chatId, messages] of Object.entries(saved)) {
+      if (Array.isArray(messages)) {
+        memory.set(chatId, messages.slice(-MEMORY_MESSAGES))
+      }
+    }
+
+    console.log('Memory loaded for chats:', memory.size)
+  } catch (e) {
+    console.log('MEMORY LOAD ERROR:', e.message)
+  }
+}
+
+async function saveMemory() {
+  try {
+    await fs.promises.mkdir(path.dirname(MEMORY_FILE), { recursive: true })
+    const saved = Object.fromEntries(memory)
+    await fs.promises.writeFile(MEMORY_FILE, JSON.stringify(saved), 'utf8')
+  } catch (e) {
+    console.log('MEMORY SAVE ERROR:', e.message)
+  }
+}
+
+function getChatHistory(chatId) {
+  return memory.get(chatId)?.slice(-MEMORY_MESSAGES) || []
+}
+
+async function remember(chatId, userText, assistantText) {
+  const history = getChatHistory(chatId)
+  history.push(
+    { role: 'user', content: userText },
+    { role: 'assistant', content: assistantText }
+  )
+  memory.set(chatId, history.slice(-MEMORY_MESSAGES))
+  await saveMemory()
+}
+
+async function askGroq(text, history = []) {
   if (!GROQ_API_KEY) {
     console.log('GROQ ERROR: GROQ_API_KEY is missing')
     return FAIL
@@ -37,6 +87,7 @@ async function askGroq(text) {
             model,
             messages: [
               { role: 'system', content: SYSTEM },
+              ...history,
               { role: 'user', content: text }
             ],
             temperature: 0.7,
@@ -63,7 +114,6 @@ async function askGroq(text) {
           JSON.stringify(data).slice(0, 300)
         )
 
-        // Try the same model again for temporary errors and rate limits.
         const temporaryError = [429, 500, 502, 503, 504].includes(res.status)
         if (temporaryError && attempt < 3) {
           const retryAfter = Number(res.headers.get('retry-after'))
@@ -74,7 +124,7 @@ async function askGroq(text) {
           continue
         }
 
-        // Move to the fallback model for model/service availability errors.
+        // Move to the fallback model after the current model fails.
         break
       } catch (e) {
         console.log('GROQ FETCH ERROR', model, 'try', attempt, e.message)
@@ -91,6 +141,8 @@ async function askGroq(text) {
 
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
+  loadMemory()
+
   const { version } = await fetchLatestBaileysVersion()
   const sock = makeWASocket({
     version,
@@ -152,8 +204,17 @@ async function start() {
           ? `الرسالة المقتبسة: ${quotedText}\n\nالطلب: ${clean}`
           : clean
 
-        const reply = await askGroq(input)
-        await sock.sendMessage(m.key.remoteJid, { text: reply }, { quoted: m })
+        // Each WhatsApp chat/group has its own separate memory.
+        const chatId = m.key.remoteJid
+        const history = getChatHistory(chatId)
+        const reply = await askGroq(input, history)
+
+        await sock.sendMessage(chatId, { text: reply }, { quoted: m })
+
+        // Do not save the temporary failure message as real conversation context.
+        if (reply !== FAIL) {
+          await remember(chatId, input, reply)
+        }
       } catch (e) {
         console.log('message error:', e.message)
       }
