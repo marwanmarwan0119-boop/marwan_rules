@@ -8,11 +8,10 @@ const rules = fs.readFileSync('./rules.txt', 'utf8')
 const SYSTEM = fs.readFileSync('./prompt.txt', 'utf8').replace('{rules}', rules)
 const AUTH_DIR = process.env.AUTH_DIR || './auth'
 const API_KEY = (process.env.GEMINI_API_KEY || '').trim()
-const MODELS = [
-  process.env.GEMINI_MODEL,
-  'gemini-3.8-flash',
-  'gemini-flash-latest'
-].filter((m, i, a) => m && a.indexOf(m) === i)
+
+// Stable Gemini model for production WhatsApp bots.
+// Set GEMINI_MODEL=gemini-3.8-flash in Railway if you want to configure it there.
+const MODEL = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim()
 
 const FAIL = 'السيرفر ديال الذكاء الاصطناعي مشغول دابا، عاود المحاولة من بعد شوية.'
 const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -22,37 +21,59 @@ async function askGemini(text) {
     console.log('GEMINI ERROR: GEMINI_API_KEY is missing')
     return FAIL
   }
-  for (const model of MODELS) {
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: SYSTEM }] },
-            contents: [{ role: 'user', parts: [{ text }] }]
-          })
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: SYSTEM }] },
+          contents: [{ role: 'user', parts: [{ text }] }]
         })
-        const data = await res.json()
-        if (res.ok) {
-          const out = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim()
-          if (out) return out
-          console.log('GEMINI EMPTY', model, JSON.stringify(data).slice(0, 300))
-          break
-        }
-        console.log('GEMINI ERROR', model, 'try', attempt, res.status, JSON.stringify(data).slice(0, 300))
-        if (res.status === 503 || res.status === 429) {
-          await sleep(2000 * attempt)
-          continue
-        }
+      })
+
+      const data = await res.json()
+
+      if (res.ok) {
+        const out = data?.candidates?.[0]?.content?.parts
+          ?.map(p => p.text || '')
+          .join('')
+          .trim()
+
+        if (out) return out
+
+        console.log('GEMINI EMPTY', MODEL, JSON.stringify(data).slice(0, 300))
         break
-      } catch (e) {
-        console.log('GEMINI FETCH ERROR', model, e.message)
+      }
+
+      console.log(
+        'GEMINI ERROR',
+        MODEL,
+        'try',
+        attempt,
+        res.status,
+        JSON.stringify(data).slice(0, 300)
+      )
+
+      // Retry only temporary overload/rate-limit errors.
+      if (res.status === 503 || res.status === 429) {
+        await sleep(2000 * attempt)
+        continue
+      }
+
+      // 404, 400, 401, etc. are configuration/API errors; retrying will not help.
+      break
+    } catch (e) {
+      console.log('GEMINI FETCH ERROR', MODEL, e.message)
+
+      if (attempt < 3) {
         await sleep(2000 * attempt)
       }
     }
   }
+
   return FAIL
 }
 
