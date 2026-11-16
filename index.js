@@ -7,49 +7,51 @@ import fs from 'fs'
 const rules = fs.readFileSync('./rules.txt', 'utf8')
 const SYSTEM = fs.readFileSync('./prompt.txt', 'utf8').replace('{rules}', rules)
 const AUTH_DIR = process.env.AUTH_DIR || './auth'
-const API_KEY = (process.env.GEMINI_API_KEY || '').trim()
+const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').trim()
 
-// Stable Gemini model for production WhatsApp bots.
-// Set GEMINI_MODEL=gemini-3.8-flash in Railway if you want to configure it there.
-const MODEL = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim()
+// Production Groq model suitable for a multilingual WhatsApp bot.
+const MODEL = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').trim()
 
 const FAIL = 'السيرفر ديال الذكاء الاصطناعي مشغول دابا، عاود المحاولة من بعد شوية.'
-const sleep = ms => new Promise(r => setTimeout(r, ms))
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-async function askGemini(text) {
-  if (!API_KEY) {
-    console.log('GEMINI ERROR: GEMINI_API_KEY is missing')
+async function askGroq(text) {
+  if (!GROQ_API_KEY) {
+    console.log('GROQ ERROR: GROQ_API_KEY is missing')
     return FAIL
   }
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`
-      const res = await fetch(url, {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Authorization': `Bearer ${GROQ_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
         body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM }] },
-          contents: [{ role: 'user', parts: [{ text }] }]
+          model: MODEL,
+          messages: [
+            { role: 'system', content: SYSTEM },
+            { role: 'user', content: text }
+          ],
+          temperature: 0.7,
+          max_tokens: 1024
         })
       })
 
       const data = await res.json()
 
       if (res.ok) {
-        const out = data?.candidates?.[0]?.content?.parts
-          ?.map(p => p.text || '')
-          .join('')
-          .trim()
-
+        const out = data?.choices?.[0]?.message?.content?.trim()
         if (out) return out
 
-        console.log('GEMINI EMPTY', MODEL, JSON.stringify(data).slice(0, 300))
+        console.log('GROQ EMPTY', MODEL, JSON.stringify(data).slice(0, 300))
         break
       }
 
       console.log(
-        'GEMINI ERROR',
+        'GROQ ERROR',
         MODEL,
         'try',
         attempt,
@@ -57,16 +59,20 @@ async function askGemini(text) {
         JSON.stringify(data).slice(0, 300)
       )
 
-      // Retry only temporary overload/rate-limit errors.
-      if (res.status === 503 || res.status === 429) {
-        await sleep(2000 * attempt)
+      // Retry temporary rate-limit or server errors only.
+      if ([429, 500, 502, 503, 504].includes(res.status) && attempt < 3) {
+        const retryAfter = Number(res.headers.get('retry-after'))
+        const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : 2000 * attempt
+        await sleep(waitMs)
         continue
       }
 
-      // 404, 400, 401, etc. are configuration/API errors; retrying will not help.
+      // 400, 401, 403, 404, etc. are configuration errors; retrying will not help.
       break
     } catch (e) {
-      console.log('GEMINI FETCH ERROR', MODEL, e.message)
+      console.log('GROQ FETCH ERROR', MODEL, e.message)
 
       if (attempt < 3) {
         await sleep(2000 * attempt)
@@ -115,14 +121,18 @@ async function start() {
     for (const m of messages) {
       try {
         if (!m.message || m.key.fromMe) continue
+
         const ext = m.message.extendedTextMessage
         const text = m.message.conversation || ext?.text
         if (!text) continue
 
         const myIds = [sock.user?.id, sock.user?.lid]
-          .filter(Boolean).map(x => x.split(':')[0].split('@')[0])
+          .filter(Boolean)
+          .map(x => x.split(':')[0].split('@')[0])
+
         const mentioned = (ext?.contextInfo?.mentionedJid || [])
           .some(j => myIds.includes(j.split('@')[0]))
+
         if (!mentioned) continue
 
         const clean = text.replace(/@\d+/g, '').trim()
@@ -132,7 +142,7 @@ async function start() {
           ? `الرسالة المقتبسة: ${quotedText}\n\nالطلب: ${clean}`
           : clean
 
-        const reply = await askGemini(input)
+        const reply = await askGroq(input)
         await sock.sendMessage(m.key.remoteJid, { text: reply }, { quoted: m })
       } catch (e) {
         console.log('message error:', e.message)
